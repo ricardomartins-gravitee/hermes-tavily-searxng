@@ -6,6 +6,10 @@ from agent.web_search_provider import WebSearchProvider, get_provider_env
 
 TIMEOUT = 10
 MAX_BODY = 2_000_000
+MAX_QUERY = 4096
+MAX_URL = 2048
+MAX_TITLE = 512
+MAX_CONTENT = 4096
 
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -25,31 +29,44 @@ def _request(url, payload, headers):
     return json.loads(raw)
 
 
-def _normalize(data, limit):
+def _normalize(data, limit, secret=""):
     if not isinstance(data, dict) or not isinstance(data.get('results'), list) or data.get('error'):
         raise ValueError('invalid response')
-    rows, skipped = [], 0
+    rows, skipped, altered = [], 0, 0
     for item in data['results']:
         if not isinstance(item, dict) or not isinstance(item.get('url'), str):
             skipped += 1
             continue
         url = item['url']
+        title, content = item.get('title'), item.get('content')
+        fields = (url, title, content)
+        if (len(url) > MAX_URL or any(isinstance(v, str) and secret and secret in v for v in fields)
+                or any(0xD800 <= ord(c) <= 0xDFFF for c in url)):
+            skipped += 1
+            continue
         try:
             parsed = urlsplit(url)
-            if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username or parsed.password:
+            if (parsed.scheme not in ('http', 'https') or not parsed.hostname or '@' in parsed.netloc
+                    or any(ord(c) <= 32 or ord(c) == 127 for c in url)):
                 skipped += 1
                 continue
+            parsed.port
         except ValueError:
             skipped += 1
             continue
-        title, content = item.get('title'), item.get('content')
-        rows.append({'title': title if isinstance(title, str) else '', 'url': url,
-                     'description': content if isinstance(content, str) else '', 'position': len(rows) + 1})
+        title = title if isinstance(title, str) else ''
+        content = content if isinstance(content, str) else ''
+        clean_title = title.encode('utf-8', 'replace').decode('utf-8')[:MAX_TITLE]
+        clean_content = content.encode('utf-8', 'replace').decode('utf-8')[:MAX_CONTENT]
+        if clean_title != title or clean_content != content:
+            altered += 1
+        rows.append({'title': clean_title, 'url': url,
+                     'description': clean_content, 'position': len(rows) + 1})
         if len(rows) >= limit:
             break
     if data['results'] and not rows:
         raise ValueError('no usable results')
-    return rows, skipped
+    return rows, skipped, altered
 
 
 class Provider(WebSearchProvider):
@@ -71,6 +88,8 @@ class Provider(WebSearchProvider):
             return {'success': False, 'error': 'Invalid search limit.'}
         if not isinstance(query, str) or not query.strip():
             return {'success': False, 'error': 'Search query must be non-empty.'}
+        if len(query) > MAX_QUERY or any(0xD800 <= ord(c) <= 0xDFFF for c in query):
+            return {'success': False, 'error': 'Invalid search query.'}
         key = get_provider_env('TAVILY_API_KEY')
         base = get_provider_env('SEARXNG_URL').rstrip('/')
         attempts = []
@@ -79,7 +98,11 @@ class Provider(WebSearchProvider):
         if base:
             try:
                 parts = urlsplit(base)
-                valid = parts.scheme in ('http', 'https') and parts.hostname and not parts.username and not parts.password and not parts.query and not parts.fragment
+                parts.port  # Validate the port even though it is optional.
+                valid = (len(base) <= MAX_URL and '?' not in base and '#' not in base
+                         and '@' not in parts.netloc and parts.scheme in ('http', 'https')
+                         and bool(parts.hostname) and not any(ord(c) <= 32 or ord(c) == 127
+                         or 0xD800 <= ord(c) <= 0xDFFF for c in base))
             except ValueError:
                 valid = False
             if valid:
@@ -88,11 +111,13 @@ class Provider(WebSearchProvider):
         for name, url, payload, headers in attempts:
             try:
                 data = _request(url, payload, headers)
-                rows, skipped = _normalize(data, limit)
+                rows, skipped, altered = _normalize(data, limit, key)
+                if name == 'searxng' and 'unresponsive_engines' in data and not isinstance(data['unresponsive_engines'], list):
+                    raise ValueError('invalid engine metadata')
                 if name == 'searxng' and not rows and data.get('unresponsive_engines'):
                     raise ValueError('no results with upstream engine failures')
-                partial = bool(skipped or data.get('unresponsive_engines'))
-                return {'success': True, 'data': {'web': rows}, 'metadata': {'provider': name, 'fallback': name == 'searxng' and bool(key), 'failed_providers': failed, 'skipped_results': skipped, 'partial': partial}}
+                partial = bool(skipped or altered or (name == 'searxng' and data.get('unresponsive_engines')))
+                return {'success': True, 'data': {'web': rows}, 'metadata': {'provider': name, 'fallback': name == 'searxng' and bool(key), 'failed_providers': failed, 'skipped_results': skipped, 'altered_results': altered, 'partial': partial}}
             except Exception:
                 # Neither raw exceptions nor upstream bodies may escape (they may contain secrets).
                 failed.append(name)
